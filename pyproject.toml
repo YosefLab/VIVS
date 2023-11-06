@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "vivs"
+version = "0.1.0"
+description = "Calibrated Variational Inference for single-cell omics."
+authors = ["Pierre Boyeau <pierre.boyeau@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.9, <3.13"
+scanpy = "^1.9.1"
+jax = {version = "^0.4.14", optional = true}
+fastcluster = "^1.2.6"
+scikit-misc = "^0.1.4"
+plotnine = "^0.12"
+flake8 = {version = ">=3.7.7", optional = true}
+black = {version = "^22.12.0", optional = true}
+pytest = {version = "^7.2.1", optional = true}
+pre-commit = {version = "^3.0.2", optional = true}
+isort = {version = "==5.11.5", optional = true}
+jupyterlab = {version = "^4.0", optional = true}
+ml-collections = "^0.1.1"
+xarray = "^2023.3.0"
+torch = "^2.1.0"
+flax = "^0.7.5"
+numpyro = "^0.13.2"
+
+[tool.poetry.extras]
+dev = ["black", "pytest", "flake8", "pre-commit", "isort"]
+notebook = ["jupyterlab"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
