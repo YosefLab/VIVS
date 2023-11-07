@@ -20,7 +20,7 @@ isort = {version = "==5.11.5", optional = true}
 jupyterlab = {version = "^4.0", optional = true}
 ml-collections = "^0.1.1"
 xarray = "^2023.3.0"
-torch = "^2.1.0"
+torch = ">=2.0.0, !=2.0.1, !=2.1.0"
 flax = "^0.7.5"
 numpyro = "^0.13.2"
 
