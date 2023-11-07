@@ -1,5 +1,8 @@
 # VIVS
 
+[![PyPI version](https://badge.fury.io/py/vivs.svg)](https://badge.fury.io/py/vivs)
+
+
 VIVS (Variational Inference for Variable Selection) is a Python package to identify molecular dependencies in omics data.
 Please refer to the [preprint](https://www.biorxiv.org/content/10.1101/2023.11.03.565520v1)
 and to the project repository [here](https://github.com/YosefLab/VIVS) for more details.
