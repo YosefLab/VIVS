@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "vivs"
-version = "0.1.0"
+version = "0.1.1"
 description = "Calibrated Variational Inference for single-cell omics."
 authors = ["Pierre Boyeau <pierre.boyeau@gmail.com>"]
 readme = "README.md"
