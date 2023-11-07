@@ -10,7 +10,7 @@ and to the project repository [here](https://github.com/YosefLab/VIVS) for more 
 
 ## Installation
 
-Currently, VIVS is only available on GitHub. To install the package, on Python >= 3.9, you can do the following:
+To install the package, on Python >= 3.9, you can do the following:
 1. install jax with GPU support (see [here](https://jax.readthedocs.io/en/latest/installation.html) for instructions)
 2. install the package using pip:
 
