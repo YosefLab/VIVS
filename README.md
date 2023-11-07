@@ -1,13 +1,19 @@
 # VIVS
 
 VIVS (Variational Inference for Variable Selection) is a Python package to identify molecular dependencies in omics data.
-
+Please refer to the [preprint](https://www.biorxiv.org/content/10.1101/2023.11.03.565520v1)
+and to the project repository [here](https://github.com/YosefLab/VIVS) for more details.
 
 ## Installation
 
 Currently, VIVS is only available on GitHub. To install the package, on Python >= 3.9, you can do the following:
--  install jax with GPU support (see [here](https://jax.readthedocs.io/en/latest/installation.html) for instructions)
-- clone the repository and install the package using pip:
+1. install jax with GPU support (see [here](https://jax.readthedocs.io/en/latest/installation.html) for instructions)
+2. install the package using pip:
+
+```bash
+pip install vivs
+```
+Alternatively, you can clone the repository and install the package in editable mode:
 
 ```bash
 pip install -e .
