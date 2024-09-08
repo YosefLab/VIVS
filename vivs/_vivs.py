@@ -840,7 +840,7 @@ class VIVS:
                 )
                 if not are_indices_contiguous:
                     raise ValueError("Gene indices are not contiguous")
-                is_cluster_detected = (res_cluster["padj"] < 0.1).all()
+                is_cluster_detected = (res_cluster["padj"] < significance_threshold).all()
                 if is_cluster_detected:
                     plot_df.append(
                         {

@@ -39,6 +39,7 @@ def test_jax():
     crttool.train_all()
     crttool.get_importance()
     crttool.get_importance(n_mc_per_pass=10)
+    crttool.get_hier_importance(n_clusters_list=[5, 10])
     crttool.get_cell_scores(gene_ids=[1, 2, 3])
     crttool.get_latent()
 
@@ -53,6 +54,7 @@ def test_jax():
     crttool.train_all()
     crttool.get_importance()
     crttool.get_importance(n_mc_per_pass=10)
+    crttool.get_hier_importance(n_clusters_list=[5, 10])
     crttool.get_cell_scores(gene_ids=[1, 2, 3])
     crttool.get_latent()
 

@@ -32,7 +32,7 @@ class AnnDataset(Dataset):
     def __getitem__(self, idx):
         xmat = self.x_mat[idx]
         if sp.issparse(xmat):
-            xmat = xmat.toarray()
+            xmat = xmat.toarray().squeeze()
         return {
             REGISTRY_KEYS.X_KEY: xmat,
             REGISTRY_KEYS.BATCH_KEY: self.batch_indices[idx],
