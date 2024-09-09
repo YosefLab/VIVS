@@ -816,6 +816,7 @@ class VIVS:
         gene_results,
         base_resolution=None,
         significance_threshold=0.1,
+        color_by=None,
         plot_fig=True,
         theme_kwargs=None,
     ):
@@ -840,7 +841,9 @@ class VIVS:
                 )
                 if not are_indices_contiguous:
                     raise ValueError("Gene indices are not contiguous")
-                is_cluster_detected = (res_cluster["padj"] < significance_threshold).all()
+                is_cluster_detected = (
+                    res_cluster["padj"] < significance_threshold
+                ).all()
                 if is_cluster_detected:
                     plot_df.append(
                         {
@@ -853,6 +856,27 @@ class VIVS:
                         }
                     )
         plot_df = pd.DataFrame(plot_df)
+
+        if color_by is not None:
+            plot_df_color = []
+            for gene in res_subset.gene_name.values:
+                res_cluster = res_subset.loc[{"gene_name": gene}]
+                xmin = res_cluster.gene_index.values.min()
+                xmax = res_cluster.gene_index.values.max()
+
+                plot_df_color.append(
+                    {
+                        "xmin": xmin - 0.5,
+                        "xmax": xmax + 0.5,
+                        "ymin": -2,
+                        "ymax": -1,
+                        "color": res_cluster[color_by].values.item(),
+                    }
+                )
+            plot_df_color = pd.DataFrame(plot_df_color)
+        else:
+            plot_df_color = None
+
         labels = list(res_subset.gene_name.values)
         breaks = list(res_subset.gene_index.values)
         if plot_fig:
@@ -878,6 +902,13 @@ class VIVS:
                 + p9.labs(x="", y="")
                 + p9.theme(**theme_kwargs)
             )
+            if plot_df_color is not None:
+                fig = fig + p9.geom_rect(
+                    plot_df_color,
+                    p9.aes(
+                        xmin="xmin", xmax="xmax", ymin="ymin", ymax="ymax", fill="color"
+                    ),
+                )
             return fig
         else:
             return plot_df, labels, breaks
