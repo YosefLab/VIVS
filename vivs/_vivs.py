@@ -9,7 +9,6 @@ import pandas as pd
 import plotnine as p9
 import scanpy as sc
 import xarray as xr
-from flax import serialization
 from ml_collections import ConfigDict
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
@@ -17,11 +16,12 @@ from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 
 from vivs._dl_utils import construct_dataloader
-from vivs._models import JAXSCVAE, ImportanceScorer, ImportanceScorerLinear
-from vivs._training import train_scvi, train_statistic
+from vivs._models import LinearImportanceScore, NeuralImportanceScore
 from vivs._utils import one_hot
 
 from ._constants import REGISTRY_KEYS
+
+from scvi.model import JaxSCVI
 
 
 class VIVS:
@@ -29,11 +29,9 @@ class VIVS:
         self,
         adata: sc.AnnData,
         feature_obsm_key: str = "protein_expression",
-        feature_names: str = None,
         batch_key: str = None,
         n_mc_samples: int = 500,
         percent_dev: float = 0.5,
-        compute_pvalue_on: str = "val",
         **config_kwargs,
     ):
         self.n_mc_samples = n_mc_samples
@@ -42,19 +40,8 @@ class VIVS:
         self.config.update(config_kwargs)
 
         self.n_genes = adata.X.shape[1]
-        self.n_features = adata.obsm[feature_obsm_key].shape[-1]
-        self.n_batch = (
-            adata.obs[batch_key].unique().shape[0] if batch_key is not None else 0
-        )
+        self.n_features = adata.obsm[feature_obsm_key].shape[1]
         feature_expression = adata.obsm[feature_obsm_key]
-
-        if batch_key is not None:
-            adata.obs.loc[:, "_batch_indices"] = (
-                adata.obs[batch_key].astype("category").cat.codes.values
-            )
-            self.batch_key = "_batch_indices"
-        else:
-            self.batch_key = None
 
         # Preprocess target expression
         self.internal_feature_key = "_vivs_feature_expression"
@@ -67,45 +54,28 @@ class VIVS:
         elif xy_loss == "binary":
             adata.obsm[self.internal_feature_key] = feature_expression
 
-        if feature_names is not None:
-            self.feature_names = feature_names
-        else:
-            self.feature_names = (
-                adata.obsm[feature_obsm_key].columns
-                if hasattr(adata.obsm[feature_obsm_key], "columns")
-                else np.arange(self.n_features)
-            )
-        self.compute_pvalue_on = compute_pvalue_on
+        self.feature_names = (
+            adata.obsm[feature_obsm_key].columns
+            if hasattr(adata.obsm[feature_obsm_key], "columns")
+            else np.arange(self.n_features)
+        )
 
         # Generative model
-        self.x_tx = self.config["x_train_kwargs"]["tx"]
-        self.xy_tx = self.config["xy_train_kwargs"]["tx"]
         self.x_model_kwargs = self.config["x_model_kwargs"]
-        self.x_model_kwargs["n_input"] = self.n_genes
 
         # Feature importance model
-        self.xy_include_batch = self.config["xy_include_batch_in_input"]
-        self.xy_input_size = (
-            self.n_genes + self.n_batch if self.xy_include_batch else self.n_genes
-        )
         xy_linear = self.config["xy_linear"]
         if xy_linear:
-            self.importance_cls = ImportanceScorerLinear
+            self.importance_cls = LinearImportanceScore
             self.importance_kwargs = dict(
                 loss_type=self.config["xy_model_kwargs"]["loss_type"],
             )
         else:
-            self.importance_cls = ImportanceScorer
+            self.importance_cls = NeuralImportanceScore
             self.importance_kwargs = self.config["xy_model_kwargs"]
-        self.importance_kwargs["n_features"] = self.n_features
         self.batch_size = self.config["batch_size"]
-        self.n_epochs = self.config["n_epochs"]
 
         # Useful preprocessing
-        adata_log = adata.copy()
-        sc.pp.normalize_total(adata_log, target_sum=1e6)
-        sc.pp.log1p(adata_log)
-        self.adata_log = adata_log
         n_obs = adata.X.shape[0]
         np.random.seed(0)
         self.is_dev = np.random.random(n_obs) <= percent_dev
@@ -117,46 +87,45 @@ class VIVS:
         self.val_adata = self.adata[~self.adata.obs["is_dev"]].copy()
 
         # Metrics and parameters
-        self.x_params = None
-        self.x_batch_stats = None
-        self.xy_batch_stats = None
-        self.xy_params = None
-        self.losses = None
+        JaxSCVI.setup_anndata(self.train_adata, batch_key=batch_key)
+        self.x_model = JaxSCVI(self.train_adata, **self.x_model_kwargs)
+        self.importance_cls.setup_anndata(
+            self.train_adata, y_obsm_key=self.internal_feature_key, batch_key=batch_key
+        )
+        self.xy_model = self.importance_cls(self.train_adata, **self.importance_kwargs)
+        # TODO: how to make sure that the setup_anndata of the xy model is valid for the x model?
 
     @staticmethod
     def get_default_config():
         config = ConfigDict()
         config.batch_size = 128
-        config.n_epochs = 200
         config.x_model_kwargs = dict(
-            n_input=None,
             n_latent=10,
-            likelihood="nb",
             dropout_rate=0.0,
             n_hidden=128,
-            last_h_activation="softplus",
+            gene_likelihood="nb",
         )
         config.x_train_kwargs = dict(
+            max_epochs=200,
             lr=1e-3,
-            patience=20,
-            tx=None,
             early_stopping_metric="elbo",
-            n_epochs_kl_warmup=50,
+            check_val_every_n_epoch=1,
+            early_stopping_patience=20,
         )
 
         config.xy_linear = False
-        config.xy_include_batch_in_input = False
         config.xy_model_kwargs = dict(
-            n_features=None,
             n_hidden=128,
             dropout_rate=0.0,
             loss_type="mse",
         )
 
         config.xy_train_kwargs = dict(
-            patience=20,
+            max_epochs=200,
             lr=1e-3,
-            tx=None,
+            early_stopping_metric="elbo",
+            check_val_every_n_epoch=1,
+            early_stopping_patience=20,
         )
         return config.lock()
 
@@ -168,168 +137,8 @@ class VIVS:
     def statistic_model(self) -> nn.Module:
         return self.importance_cls(**self.importance_kwargs)
 
-    def train_scvi(self):
-        """Train the generative model."""
-
-        losses, x_params, x_batch_stats = train_scvi(
-            generative_model=self.generative_model,
-            train_adata=self.train_adata,
-            val_adata=self.val_adata,
-            batch_size=self.batch_size,
-            batch_key=self.batch_key,
-            protein_key=self.internal_feature_key,
-            n_epochs=self.n_epochs,
-            **self.config["x_train_kwargs"],
-        )
-        self.set_or_update_metrics(losses)
-        self.x_params = x_params
-        self.x_batch_stats = x_batch_stats
-
-    def train_statistic(self):
-        """Train the feature importance model."""
-
-        losses, xy_params, xy_batch_stats = train_statistic(
-            statistic_model=self.statistic_model,
-            train_adata=self.train_adata,
-            val_adata=self.val_adata,
-            batch_size=self.batch_size,
-            batch_key=self.batch_key,
-            protein_key=self.internal_feature_key,
-            n_epochs=self.n_epochs,
-            include_batch_in_input=self.xy_include_batch,
-            **self.config["xy_train_kwargs"],
-        )
-        self.set_or_update_metrics(losses)
-        self.xy_params = xy_params
-        self.xy_batch_stats = xy_batch_stats
-
-    def train_all(self):
-        self.train_scvi()
-        self.train_statistic()
-
-    def get_importance(self, eval_adata=None, batch_size=128, n_mc_per_pass=1):
-        if eval_adata is None:
-            if self.compute_pvalue_on == "val":
-                eval_adata = self.adata[~self.adata.obs["is_dev"]].copy()
-            elif self.compute_pvalue_on == "all":
-                eval_adata = self.adata.copy()
-        n_obs = eval_adata.X.shape[0]
-
-        eval_dl = construct_dataloader(
-            eval_adata,
-            batch_size=batch_size,
-            shuffle=False,
-            batch_key=self.batch_key,
-            protein_key=self.internal_feature_key,
-        )
-        total_its = n_obs // batch_size
-
-        rng = jax.random.PRNGKey(0)
-        x_rng, z_rng = jax.random.split(rng)
-
-        tilde_ts = jnp.zeros((self.n_mc_samples, self.n_genes, self.n_features))
-        observed_ts = jnp.zeros((self.n_features,))
-        gene_ids = jnp.arange(self.n_genes)
-
-        @jax.jit
-        def get_tilde_t(x, batch_indices, y):
-            x_ = jnp.log1p(1e6 * x / jnp.sum(x, axis=-1, keepdims=True))
-            x_ = self.process_xy_input(x_, batch_indices)
-            res = self.statistic_model.apply(
-                {
-                    "params": self.xy_params,
-                    "batch_stats": self.xy_batch_stats,
-                },
-                x_,
-                y,
-                training=False,
-            )["all_loss"].sum(0)
-            return res
-
-        @jax.jit
-        def randomize(inputs, z_rng):
-            outs = self.generative_model.apply(
-                {
-                    "params": self.x_params,
-                    "batch_stats": self.x_batch_stats,
-                },
-                *inputs,
-                rngs={"z": z_rng},
-                training=False,
-            )
-            px = outs["px"]
-            return px
-
-        def _compute_loss(x, xtilde, gene_id, batch_indices, y):
-            x_ = x.at[..., gene_id].set(xtilde)
-            x__ = jnp.log1p(1e6 * x_ / jnp.sum(x_, axis=-1, keepdims=True))
-            x__ = self.process_xy_input(x__, batch_indices)
-            # shape (n_cells, n_proteins)
-            res = self.statistic_model.apply(
-                {
-                    "params": self.xy_params,
-                    "batch_stats": self.xy_batch_stats,
-                },
-                x__,
-                y,
-                training=False,
-            )["all_loss"].sum(0)
-            return res
-
-        @jax.jit
-        def compute_tilde_t(x, px, x_rng, batch_indices, y):
-            _x_tilde = px.sample(x_rng)
-            _tilde_t_k = jax.vmap(_compute_loss, (None, -1, 0, None, None), 0)(
-                x, _x_tilde, gene_ids, batch_indices, y
-            )
-            return _tilde_t_k
-
-        @jax.jit
-        def double_compute_tilde_t(x, px, x_rng, batch_indices, y):
-            _x_tilde = px.sample(x_rng, sample_shape=(n_mc_per_pass,))
-            _fn = jax.vmap(_compute_loss, (None, -1, 0, None, None), 0)
-            _fn = jax.vmap(_fn, (None, 0, None, None, None), 0)
-            return _fn(x, _x_tilde, gene_ids, batch_indices, y)
-
-        n_passes = self.n_mc_samples // n_mc_per_pass
-
-        for tensors in tqdm(eval_dl, total=total_its):
-            x = jnp.array(tensors[REGISTRY_KEYS.X_KEY])
-            batch_indices = jnp.array(tensors[REGISTRY_KEYS.BATCH_KEY])
-            protein_expression = jnp.array(tensors[self.feature_field_name])
-
-            observed_ts += get_tilde_t(x, batch_indices, protein_expression) / n_obs
-            px = randomize([x, batch_indices], z_rng)
-
-            _tilde_t = []
-            if n_mc_per_pass == 1:
-                for _ in range(self.n_mc_samples):
-                    _tilde_t_k = compute_tilde_t(
-                        x, px, x_rng, batch_indices, protein_expression
-                    )
-                    _tilde_t.append(_tilde_t_k[None])
-                    x_rng, _ = jax.random.split(x_rng)
-            else:
-                for _ in range(n_passes):
-                    _tilde_t_k = double_compute_tilde_t(
-                        x, px, x_rng, batch_indices, protein_expression
-                    )
-                    _tilde_t.append(_tilde_t_k)
-                    x_rng, _ = jax.random.split(x_rng)
-            _tilde_t = jnp.concatenate(_tilde_t, axis=0)
-            tilde_ts += _tilde_t / n_obs
-            z_rng, _ = jax.random.split(z_rng)
-        pval = (1.0 + (observed_ts >= tilde_ts).sum(0)) / (1.0 + self.n_mc_samples)
-        padj = np.array(
-            [multipletests(_pval, method="fdr_bh")[1] for _pval in pval.T]
-        ).T
-
-        return dict(
-            obs_ts=np.asarray(observed_ts),
-            null_ts=np.asarray(tilde_ts),
-            pvalues=np.asarray(pval),
-            padj=padj,
-        )
+    def train(self):
+        TODO
 
     def get_cell_scores(
         self,
@@ -445,27 +254,6 @@ class VIVS:
             tilde_t_mean=tilde_t_mean,
             obs_t=obs_t,
         )
-
-    def save_params(self, save_path, save_adata=False):
-        x_params_bytes = serialization.to_bytes(self.x_params)
-        x_batch_stats_bytes = serialization.to_bytes(self.x_batch_stats)
-        xy_batch_stats_bytes = serialization.to_bytes(self.xy_batch_stats)
-        xy_params_bytes = serialization.to_bytes(self.xy_params)
-
-        files = [
-            (x_params_bytes, "x_params_bytes"),
-            (x_batch_stats_bytes, "x_batch_stats_bytes"),
-            (xy_batch_stats_bytes, "xy_batch_stats_bytes"),
-            (xy_params_bytes, "xy_params_bytes"),
-        ]
-        for file, name in files:
-            with open(os.path.join(save_path, name), "wb") as f:
-                f.write(file)
-
-        if save_adata:
-            self.adata.write(os.path.join(save_path, "adata.h5ad"))
-
-        self.init_params.to_csv(os.path.join(save_path, "init_params.csv"))
 
     def get_gene_correlations(self, adata=None):
         """Compute G times G gene correlation matrix."""
@@ -680,10 +468,7 @@ class VIVS:
             Whether to use vmap for parallelization.
         """
         if eval_adata is None:
-            if self.compute_pvalue_on == "val":
-                eval_adata = self.adata[~self.adata.obs["is_dev"]].copy()
-            elif self.compute_pvalue_on == "all":
-                eval_adata = self.adata.copy()
+            eval_adata = self.adata[~self.adata.obs["is_dev"]].copy()
         n_obs = eval_adata.X.shape[0]
 
         # construct dataloader
@@ -980,27 +765,3 @@ class VIVS:
                 )
             )
         return xr.concat(datasets, dim="resolution").reindex(gene_name=gene_order)
-
-    def set_or_update_metrics(self, metrics: pd.DataFrame):
-        """
-        Update the metrics dataframe.
-        """
-
-        if self.losses is None:
-            self.losses = metrics
-        else:
-            self.losses = pd.concat([self.losses, metrics])
-
-    def process_xy_input(
-        self, x: jnp.ndarray, batch_indices: jnp.ndarray
-    ) -> jnp.ndarray:
-        """
-        Process inputs for the feature importance model.
-        """
-        return (
-            jnp.concatenate(
-                [x, jax.nn.one_hot(batch_indices.squeeze(-1), self.n_batch)], axis=-1
-            )
-            if self.xy_include_batch
-            else x
-        )
