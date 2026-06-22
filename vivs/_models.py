@@ -1,252 +1,128 @@
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
-import jax.random as random
-import numpyro.distributions as dist
-from numpyro.distributions import constraints
-from numpyro.distributions.util import is_prng_key
+from vivs._constants import REGISTRY_KEYS
+from scvi.model.base import BaseModelClass, JaxTrainingMixin
+from scvi.data import AnnDataManager, fields
+from scvi.utils import setup_anndata_dsp
+
+from abc import ABC
 
 
-class ZINB(dist.NegativeBinomial2):
-    """Custom ZINB distribution."""
-
-    arg_constraints = {
-        "mean": constraints.positive,
-        "concentration": constraints.positive,
-        "gate": constraints.unit_interval,
-    }
-    support = constraints.nonnegative_integer
-
-    def __init__(self, mean, concentration, gate, *, validate_args=None):
-        self.gate = gate
-        super(ZINB, self).__init__(mean, concentration, validate_args=validate_args)
-
-    def sample(self, key, sample_shape=()):
-        assert is_prng_key(key)
-        key_bern, key_base = random.split(key)
-        shape = sample_shape + self.batch_shape
-
-        samples = super(ZINB, self).sample(key_base, sample_shape=sample_shape)
-        mask = random.bernoulli(key_bern, self.gate, shape)
-        return jnp.where(mask, 0, samples)
-
-    def log_prob(self, value):
-        log_prob = super(ZINB, self).log_prob(value)
-        log_prob = jnp.log1p(-self.gate) + log_prob
-        return jnp.where(value == 0, jnp.log(self.gate + jnp.exp(log_prob)), log_prob)
+from ._modules import NeuralNet, LinearModel
 
 
-class FlaxEncoder(nn.Module):
-    """Encoder for Jax VAE."""
+class _ImportanceScore(ABC, JaxTrainingMixin, BaseModelClass):
+    """
+    Abstract base class for Importance Score models.
 
-    n_input: int
-    n_latent: int
-    n_hidden: int
-    precision: str
+    This class provides the common structure and `setup_anndata` method for
+    various Importance Score implementations. It is not intended for direct
+    instantiation. Instead, use concrete subclasses like `LinearImportanceScore`
+    or `NeuralImportanceScore`.
+    """
 
-    def setup(self):
-        """Setup encoder."""
-        self.dense1 = nn.Dense(self.n_hidden, precision=self.precision)
-        self.dense2 = nn.Dense(self.n_hidden, precision=self.precision)
-        self.dense3 = nn.Dense(self.n_latent, precision=self.precision)
-        self.dense4 = nn.Dense(self.n_latent, precision=self.precision)
+    def __init__(self, adata):
+        super().__init__(adata)
+        self.n_features = self.summary_stats.n_vars
+        self.n_responses = self.summary_stats.n_Y
 
-        self.norm1 = nn.BatchNorm(momentum=0.99, epsilon=0.001)
-        self.norm2 = nn.BatchNorm(momentum=0.99, epsilon=0.001)
-
-    def __call__(self, x: jnp.ndarray, training: bool = False):
-        """Forward pass."""
-        is_eval = not training
-
-        x_ = jnp.log1p(x)
-
-        h = self.dense1(x_)
-        h = self.norm1(h, use_running_average=is_eval)
-        h = nn.relu(h)
-        h = self.norm2(h, use_running_average=is_eval)
-        h = nn.relu(h)
-
-        mean = self.dense3(h)
-        log_var = self.dense4(h)
-        return dist.Normal(mean, nn.softplus(log_var))
-
-
-class FlaxDecoder(nn.Module):
-    """Decoder for Jax VAE."""
-
-    n_input: int
-    n_hidden: int
-    precision: str
-    last_h_activation: str = "softmax"
-
-    def setup(self):
-        """Setup decoder."""
-        self.dense1 = nn.Dense(self.n_hidden, precision=self.precision)
-        self.dense2 = nn.Dense(self.n_hidden, precision=self.precision)
-        self.dense3 = nn.Dense(self.n_hidden, precision=self.precision)
-        self.dense4 = nn.Dense(self.n_hidden, precision=self.precision)
-        self.dense5 = nn.Dense(self.n_input, precision=self.precision)
-
-        self.norm1 = nn.BatchNorm(momentum=0.99, epsilon=0.001)
-        self.norm2 = nn.BatchNorm(momentum=0.99, epsilon=0.001)
-        self.disp = self.param(
-            "disp", lambda rng, shape: jax.random.normal(rng, shape), (self.n_input, 1)
-        )
-
-        self.zi_logits1 = nn.Dense(self.n_hidden)
-        self.zi_logits2 = nn.Dense(self.n_hidden)
-        self.zi_logits3 = nn.Dense(self.n_input)
-        self.zi_logits_norm = nn.BatchNorm(momentum=0.99, epsilon=0.001)
-
-    def __call__(self, z: jnp.ndarray, batch: jnp.ndarray, training: bool = False):
-        """Forward pass."""
-        is_eval = not training
-
-        h = self.dense1(z)
-        h += self.dense2(batch)
-
-        h = self.norm1(h, use_running_average=is_eval)
-        h = nn.relu(h)
-        h = self.dense3(h)
-        h = self.norm2(h, use_running_average=is_eval)
-        h = nn.relu(h)
-        h = self.dense5(h)
-        if self.last_h_activation == "softmax":
-            h = nn.softmax(h)
-        elif self.last_h_activation == "softplus":
-            h = nn.softplus(h)
-
-        logits = self.zi_logits1(z)
-        logits += self.zi_logits2(batch)
-        logits = self.zi_logits_norm(logits, use_running_average=is_eval)
-        logits = nn.relu(logits)
-        logits = self.zi_logits3(logits)
-        probs = nn.sigmoid(logits)
-        return h, self.disp.ravel(), probs
-
-
-class JAXSCVAE(nn.Module):
-    n_input: int
-    n_latent: int
-    n_hidden: int
-    precision: str = None
-    likelihood: str = "nb"
-    dropout_rate: float = 0.0
-    last_h_activation: str = "softmax"
-
-    def setup(self):
-        self.encoder = FlaxEncoder(
-            self.n_input, self.n_latent, self.n_hidden, precision=self.precision
-        )
-        self.decoder = FlaxDecoder(
-            self.n_input,
-            self.n_hidden,
-            precision=self.precision,
-            last_h_activation=self.last_h_activation,
-        )
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
-
-    def __call__(
-        self,
-        x,
-        batch_indices,
-        n_samples=1,
-        training: bool = False,
-        use_prior=False,
-        kl_weight=1.0,
+    @classmethod
+    @setup_anndata_dsp.dedent
+    def setup_anndata(
+        cls,
+        adata,
+        y_obsm_key: str,
+        y_names_uns_key: str | None = None,
+        batch_key: str | None = None,
+        layer: str | None = None,
+        size_factor_key: str | None = None,
+        categorical_covariate_keys: list[str] | None = None,
+        continuous_covariate_keys: list[str] | None = None,
+        **kwargs,
     ):
-        z_rng = self.make_rng("z")
-        sample_shape = () if n_samples == 1 else (n_samples,)
-        x_ = jnp.log1p(x)
-        x_ = self.dropout(x_, deterministic=not training)
-        if use_prior:
-            qz = dist.Normal(0, 1)
-        else:
-            qz = self.encoder(x_, training=training)
-        z = qz.rsample(z_rng, sample_shape=sample_shape)
+        """%(summary)s.
 
-        h, disp, probs = self.decoder(z, batch_indices, training=training)
-        if self.last_h_activation == "softmax":
-            library = x.sum(-1, keepdims=True)
-            scale = h * library
-        else:
-            scale = h
-        if self.likelihood == "nb":
-            px = dist.NegativeBinomial2(scale, jnp.exp(disp))
-        elif self.likelihood == "zinb":
-            px = ZINB(scale, jnp.exp(disp), probs)
-        else:
-            px = dist.Poisson(scale)
-        log_px = px.log_prob(x).sum(-1)
-        kl = dist.kl_divergence(qz, dist.Normal(0, 1)).sum(-1)
-        elbo = log_px - (kl_weight * kl)
-        loss = -elbo.mean()
-        reconstruction_loss = -log_px.mean()
-        return dict(
-            loss=loss, h=h, z=z, px=px, reconstruction_loss=reconstruction_loss, qz=qz
+        Parameters
+        ----------
+        %(param_adata)s
+        protein_expression_obsm_key
+            key in `adata.obsm` for protein expression data.
+        protein_names_uns_key
+            key in `adata.uns` for protein names. If None, will use the column names of
+            `adata.obsm[protein_expression_obsm_key]` if it is a DataFrame, else will assign
+            sequential names to proteins.
+        %(param_batch_key)s
+        %(param_layer)s
+        %(param_size_factor_key)s
+        %(param_cat_cov_keys)s
+        %(param_cont_cov_keys)s
+
+        Returns
+        -------
+        %(returns)s
+        """
+
+        setup_method_args = cls._get_setup_method_args(**locals())
+        batch_field = fields.CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key)
+        anndata_fields = [
+            fields.LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+            fields.CategoricalObsField(
+                REGISTRY_KEYS.LABELS_KEY, None
+            ),  # Default labels field for compatibility with TOTALVAE
+            fields.CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
+            fields.NumericalObsField(
+                REGISTRY_KEYS.SIZE_FACTOR_KEY, size_factor_key, required=False
+            ),
+            fields.CategoricalJointObsField(
+                REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys
+            ),
+            fields.NumericalJointObsField(
+                REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys
+            ),
+            fields.ProteinObsmField(
+                REGISTRY_KEYS.Y_KEY,
+                y_obsm_key,
+                use_batch_mask=True,
+                batch_field=batch_field,
+                colnames_uns_key=y_names_uns_key,
+                is_count_data=False,
+            ),
+        ]
+        adata_manager = AnnDataManager(
+            fields=anndata_fields, setup_method_args=setup_method_args
+        )
+        adata_manager.register_fields(adata, **kwargs)
+        cls.register_manager(adata_manager)
+
+    def to_device(self, device):
+        pass
+
+    @property
+    def device(self):
+        return self.module.device
+
+
+class LinearImportanceScore(_ImportanceScore):
+    def __init__(self, adata):
+        super().__init__(adata)
+        n_batch = self.summary_stats.n_batch
+        self.module = LinearModel(
+            n_features=self.n_features, n_batch=n_batch, loss_type="mse"
         )
 
 
-class ImportanceScorer(nn.Module):
-    """
-    Importance score relying on a neural network.
-
-    The employed score corresponds to the negative log likelihood
-    whose parameters are predicted by a neural network.
-    """
-
-    n_hidden: int
-    n_features: int
-    dropout_rate: float
-    loss_type: str = "mse"
-
-    def setup(self):
-        self.dense1 = nn.Dense(features=self.n_hidden)
-        self.dense_res = nn.Dense(features=self.n_features)
-        self.norm1 = nn.BatchNorm(momentum=0.99, epsilon=0.001)
-        self.dropout1 = nn.Dropout(rate=self.dropout_rate)
-        self.dense3 = nn.Dense(features=self.n_features)
-
-        self.log_std = 0.0
-
-    def __call__(self, x, y, training: bool = False):
-        is_eval = not training
-
-        h = self.dense1(x)
-        h = self.norm1(h, use_running_average=is_eval)
-        h = nn.leaky_relu(h)
-        h = self.dropout1(h, deterministic=is_eval)
-
-        h = self.dense3(h)
-
-        if self.loss_type == "mse":
-            all_loss = -dist.Normal(h, jnp.exp(self.log_std)).log_prob(y)
-        elif self.loss_type == "binary":
-            all_loss = -dist.Bernoulli(logits=h).log_prob(y)
-        loss = all_loss.mean()
-        return dict(h=h, loss=loss, all_loss=all_loss)
-
-
-class ImportanceScorerLinear(nn.Module):
-    """Importance score relying on a linear model."""
-
-    n_features: int
-    loss_type: str = "mse"
-
-    def setup(self):
-        self.dense1 = nn.Dense(features=self.n_features)
-        self.norm1 = nn.BatchNorm(momentum=0.99, epsilon=0.001)
-        self.dropout1 = nn.Dropout(rate=0.0)
-        self.log_std = 0.0
-
-    def __call__(self, x, y, training: bool = False):
-        is_eval = not training
-        h = self.norm1(x, use_running_average=is_eval)
-        h = self.dropout1(h, deterministic=is_eval)
-        h = self.dense1(h)
-        if self.loss_type == "mse":
-            all_loss = -dist.Normal(h, jnp.exp(self.log_std)).log_prob(y)
-        elif self.loss_type == "binary":
-            all_loss = -dist.Bernoulli(logits=h).log_prob(y)
-        loss = all_loss.mean()
-        return dict(h=h, loss=loss, all_loss=all_loss)
+class NeuralImportanceScore(_ImportanceScore):
+    def __init__(
+        self,
+        adata,
+        n_hidden: int = 100,
+        dropout_rate: float = 0.1,
+        loss_type: str = "mse",
+    ):
+        super().__init__(adata)
+        n_batch = self.summary_stats.n_batch
+        self.module = NeuralNet(
+            n_features=self.n_features,
+            n_batch=n_batch,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+            loss_type="mse",
+        )

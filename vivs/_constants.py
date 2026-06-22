@@ -6,6 +6,7 @@ class _REGISTRY_KEYS_NT(NamedTuple):
     BATCH_KEY: str = "batch"
     LABELS_KEY: str = "labels"
     PROTEIN_EXP_KEY: str = "proteins"
+    Y_KEY: str = "Y"
     CAT_COVS_KEY: str = "extra_categorical_covs"
     CONT_COVS_KEY: str = "extra_continuous_covs"
     INDICES_KEY: str = "ind_x"

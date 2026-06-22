@@ -19,6 +19,19 @@ def generate_random_data(n_cells, n_genes, n_proteins):
     )
 
 
+def test_vivs():
+    adata = generate_random_data(1000, 300, 10)
+    adata.obs["batch"] = np.random.randint(0, 2, adata.shape[0])
+    adata.var_names = [f"gene_{idx}" for idx in range(adata.shape[1])]
+
+    crttool = VIVS(
+        adata,
+        feature_obsm_key="protein_expression",
+        batch_key="batch",
+        n_mc_samples=500,
+        percent_dev=0.5,
+    )
+
 def test_selection():
     adata = generate_random_data(1000, 300, 10)
     adata_ = select_genes(adata, n_top_genes=50)
